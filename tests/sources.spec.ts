@@ -680,6 +680,49 @@ describe('github source', () => {
       detail: '0 notifications; next poll ≥ 60s; dropped after their reads kept failing: #16' })
     h.store.close()
   })
+  it('leaves a Thread of the repository another one replaced, and forgets the replaced repository\'s read state', async () => {
+    const h = host()
+    h.store.set('github-repository', 'acme/widgets')
+    h.store.set('github-since', '2026-09-01T00:00:00.000Z')
+    h.store.set('github-cursor:13', '2026-09-01T00:00:00.000Z')
+    h.store.set('github-ci:13', { fingerprint: 'old', revision: 2 })
+    h.store.set('github-retry', { 13: { since: '2026-09-01T00:00:00.000Z', pr: true } })
+    h.store.set('github-stream:issues', { since: '2026-09-01T00:00:00.000Z', started: {} })
+    h.store.set('github-branch-ci', { branch: 'main', failures: ['old'], revision: 3 })
+    h.store.threads.save({ key: 'github:13', ref: { source: 'github', id: '13' }, createdAt: '', lastAt: new Date().toISOString(),
+      subscriptions: ['t13'], correlated: [], pending: [], meta: { number: 13, isPr: true,
+        url: 'https://github.com/acme/old-pull/pull/13', pollError: 'Error: gh: Not Found (HTTP 404)' } })
+    h.store.threads.save({ key: 'github:14', ref: { source: 'github', id: '14' }, createdAt: '', lastAt: new Date().toISOString(),
+      subscriptions: ['t14'], correlated: [], pending: [], meta: { number: 14 } })
+    // The same Source now polls another repository; the old Thread's number may not exist there, or may name another entity.
+    h.deployment.repository = 'acme/gadgets'
+    const reads: string[] = []
+    vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
+      const path = args[1]!.replace(/^repos\/acme\/gadgets\//, '').split('?')[0]!
+      reads.push(path)
+      if (path === 'notifications') return 'HTTP/2.0 200 OK\r\nX-Poll-Interval: 60\r\n\r\n[]'
+      if (path === 'issues/14') return JSON.stringify(issue(14, { html_url: 'https://github.com/acme/gadgets/issues/14' }))
+      if (path === 'issues/14/comments') return JSON.stringify([[]])
+      throw refused(404, 'Not Found')
+    })
+    await pollRound(h)
+    expect(bare(reads)).not.toContain('issues/13')
+    expect(bare(reads)).not.toContain('pulls/13')
+    expect(bare(reads)).toContain('issues/14/comments')
+    expect(h.health.github).toMatchObject({ state: 'ready' })
+    // Cursors, retries, stream positions and CI baselines of the replaced repository are discarded; the account-wide
+    // notifications cursor stays and advances as usual.
+    expect(h.store.get('github-repository')).toBe('acme/gadgets')
+    expect(h.store.get('github-cursor:13')).toBeUndefined()
+    expect(h.store.get('github-ci:13')).toBeUndefined()
+    expect(h.store.get('github-retry')).toEqual({})
+    expect(h.store.get('github-stream:issues')).toBeUndefined()
+    expect(h.store.get('github-branch-ci')).toBeUndefined()
+    expect(Date.parse(h.store.get<string>('github-since')!)).toBeGreaterThan(Date.parse('2026-09-01T00:00:00.000Z'))
+    expect(h.store.threads.get('github:13')!.meta).not.toHaveProperty('pollError')
+    expect(h.store.threads.get('github:14')!.meta).toMatchObject({ repository: 'acme/gadgets' })
+    h.store.close()
+  })
   it('polls the PRs of open tickets and subscribed Threads although the notifications fail, and then fails the round', async () => {
     const h = host()
     h.store.set('github-since', '2026-09-08T00:00:00.000Z')

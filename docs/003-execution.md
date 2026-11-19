@@ -169,6 +169,8 @@ A notified Issue or pull request whose reads keep failing is dropped a day after
 
 Its read position stays where it was, so a later notification or a poll of its Thread reads what the failed reads missed.
 
+A Thread records the repository whose Issue or pull request it reads. Changing the configured repository discards the previous repository's read positions, notification retries, stream cursors and CI baselines on the next poll, and leaves those Threads alone, clearing the read error they kept, so a number that means another entity in the new repository is never read as the old one.
+
 The Feishu event consumer reports every failure, and polling of subscribed topics keeps each failure on its Thread.
 
 A malformed item in a GitHub list or a Feishu page is skipped, and the Source's state counts it.

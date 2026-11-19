@@ -48,7 +48,7 @@ export function sourceContextOf(deps: SourceContextDeps, kind: { kind: string; h
     state: {
       get: name => store.get(name),
       set: (name, value) => { if (value === undefined) store.delete(name); else store.set(name, value) },
-      keys: prefix => store.keys(prefix),
+      keys: (prefix: string | { readonly prefix: string }) => store.keys(typeof prefix === 'string' ? prefix : prefix.prefix),
     },
     threads: {
       get: key => store.threads.get(key),

@@ -156,6 +156,39 @@ export interface Retry { since: string; pr: boolean; failedAt?: string; attempts
 const RETRY_WINDOW_MS = 24 * 3600_000
 /** True when GitHub returns HTTP 410 (Gone); HTTP 404 is retried because it can indicate revoked access to a private repository. */
 const deleted = (error: unknown): boolean => error instanceof CliError && error.code === 410
+/** Repository a Thread belongs to: recorded when the Source read it, or parsed from the URL of a Thread read before that was recorded. */
+function threadRepository(thread: Thread): string | undefined {
+  const recorded = thread.meta.repository
+  if (typeof recorded === 'string' && recorded) return recorded
+  const url = thread.meta.url
+  return typeof url === 'string' ? /^https?:\/\/github\.com\/([^/]+\/[^/]+)\//i.exec(url)?.[1] : undefined
+}
+/** True for a Thread of another repository; this Source leaves it alone and clears the error left by reading it as the configured one. */
+function elsewhere(ctx: SourceContext, thread: Thread): boolean {
+  const repository = threadRepository(thread)
+  if (!repository || sameName(repository, ctx.deployment.repository)) return false
+  if (thread.meta.pollError !== undefined) ctx.threads.patch(thread.key, { pollError: undefined })
+  return true
+}
+/**
+ * Forgets the repository-scoped read state of a previous repository on the first poll after a switch, so its cursors, retries
+ * and CI baselines are not applied to the configured repository. The notifications cursor is account-wide and stays.
+ */
+function forgetOtherRepository(ctx: SourceContext): void {
+  const repository = ctx.deployment.repository
+  if (!repository) return
+  const stored = ctx.state.get(KV.github.repository)
+  if (stored && !sameName(stored, repository)) {
+    ctx.atomic(() => {
+      for (const key of ctx.state.keys(KV.github.cursor.prefix)) ctx.state.set(key, undefined)
+      for (const key of ctx.state.keys(KV.github.stream.prefix)) ctx.state.set(key, undefined)
+      for (const key of ctx.state.keys(KV.github.ci.prefix)) ctx.state.set(key, undefined)
+      ctx.state.set(KV.github.retries, undefined)
+      ctx.state.set(KV.github.branchCi, undefined)
+    })
+  }
+  if (stored !== repository) ctx.state.set(KV.github.repository, repository)
+}
 /** Records a failed read on the Thread and in the round; deleted (410) or abandoned (24h+) threads do not fail the round. */
 function failed(ctx: SourceContext, round: Round, number: number, error: unknown, abandoned = false): void {
   if (deleted(error)) round.dropped.push(number)
@@ -279,6 +312,7 @@ async function pollBranchCi(ctx: SourceContext, round: Round): Promise<void> {
  */
 export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promise<number> {
   const round = newRound(signal)
+  forgetOtherRepository(ctx)
   const notified = await pollNotifications(ctx, round).then(value => ({ value }), (error: unknown) => ({ error }))
   await pollRepository(ctx, round)
   await pollTicketPulls(ctx, signal, round)
@@ -376,7 +410,11 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
 function pull(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
   let read = round.pulls.get(number)
   if (!read) {
-    read = readPull(ctx, number, round.signal).then(async pr => { await observePull(ctx, pr); return pr })
+    read = readPull(ctx, number, round.signal).then(async pr => {
+      await observePull(ctx, pr)
+      ctx.threads.patch(`github:${number}`, { repository: ctx.deployment.repository })
+      return pr
+    })
     round.pulls.set(number, read)
   }
   return read
@@ -405,6 +443,8 @@ export async function pollTicketPulls(ctx: SourceContext, signal?: AbortSignal, 
   const numbers = [...new Set(ctx.tickets.open().flatMap(ticket => pullsOf(ticket, true)))]
   for (const number of numbers) {
     if (stopped(ctx, round)) return
+    const thread = ctx.threads.get(`${SOURCE}:${number}`)
+    if (thread && elsewhere(ctx, thread)) continue
     try {
       const pr = await pull(ctx, round, number)
       if (pr.state !== 'closed' && !pr.merged) await pollChecks(ctx, round, number, pr)
@@ -423,7 +463,7 @@ async function pollChecks(ctx: SourceContext, round: Round, number: number, pr: 
   ctx.threads.describe(`github:${number}`, { facts: { ci: ciFact(ciCounts(snapshot)) } })
 }
 function nameThread(ctx: SourceContext, number: number, title: string): void {
-  ctx.threads.patch(`github:${number}`, { title })
+  ctx.threads.patch(`github:${number}`, { title, repository: ctx.deployment.repository })
   ctx.threads.describe(`github:${number}`, { label: `#${number} ${title}`, facts: { number: { value: `#${number}` } } })
 }
 /** Polls subscribed Issue and PR Threads not already read in this round; a deleted (410) Issue is still polled within the horizon (costing one read) and does not fail the round. */
@@ -435,7 +475,7 @@ export async function pollThreads(ctx: SourceContext, signal?: AbortSignal, roun
       if (deleted(error)) round.dropped.push(Number(thread.ref.id)); else round.failures.push(`${thread.key}: ${String(error)}`)
       throw error
     }
-  }, thread => round.read.has(Number(thread.ref.id)))
+  }, thread => round.read.has(Number(thread.ref.id)) || elsewhere(ctx, thread))
 }
 async function pollThread(ctx: SourceContext, round: Round, thread: Thread): Promise<void> {
   // The default branch's CI Thread has no Issue or PR to read; its CI arrives as Triggers.
@@ -445,7 +485,7 @@ async function pollThread(ctx: SourceContext, round: Round, thread: Thread): Pro
   round.read.add(number)
   if (typeof thread.meta.isPr !== 'boolean' || typeof thread.meta.title !== 'string') {
     const issue = await ctx.commands.withSignal(round.signal).api(IssueSchema, `issues/${number}`)
-    ctx.threads.patch(thread.key, { number, isPr: !!issue.pull_request, url: issue.html_url })
+    ctx.threads.patch(thread.key, { number, isPr: !!issue.pull_request, url: issue.html_url, repository: ctx.deployment.repository })
     if (issue.title) nameThread(ctx, number, issue.title)
     thread = ctx.threads.get(thread.key) ?? thread
   }
